@@ -2,17 +2,17 @@
 <#
 .SYNOPSIS
     Upgrades the Velociraptor Windows client to 0.76.2 using the endpoint's
-    existing client.config.yaml automatically.
+    existing client.config.yaml and automatic service discovery.
 
 .DESCRIPTION
     - Downloads the official Velociraptor 0.76.2 MSI.
-    - Stops the existing Velociraptor service.
-    - Backs up the existing client.config.yaml already present on the endpoint.
+    - Detects the installed Velociraptor service automatically.
+    - Stops the service if present.
+    - Backs up the existing client.config.yaml already on the endpoint.
     - Installs the new MSI silently.
-    - Restores the original client.config.yaml in case the stock MSI overwrote it
-      with the placeholder config.
+    - Restores the original client.config.yaml in case the MSI overwrote it.
     - Starts the service and verifies health/version.
-    - Does NOT touch velociraptor.writeback.yaml, preserving client identity.
+    - Does NOT modify velociraptor.writeback.yaml.
 
 .NOTES
     Run as Administrator.
@@ -39,21 +39,18 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
 
-# Velociraptor paths
-$InstallDir         = "C:\Program Files\Velociraptor"
-$ExePath            = Join-Path $InstallDir "Velociraptor.exe"
-$InstalledConfig    = Join-Path $InstallDir "client.config.yaml"
-$WritebackPath      = Join-Path $InstallDir "velociraptor.writeback.yaml"
-$ServiceName        = "Velociraptor"
+$InstallDir              = "C:\Program Files\Velociraptor"
+$ExePath                 = Join-Path $InstallDir "Velociraptor.exe"
+$InstalledConfig         = Join-Path $InstallDir "client.config.yaml"
+$WritebackPath           = Join-Path $InstallDir "velociraptor.writeback.yaml"
 
-# Working paths
-$DownloadDir        = Join-Path $WorkingDirectory "Downloads"
-$LogDir             = Join-Path $WorkingDirectory "Logs"
-$BackupDir          = Join-Path $WorkingDirectory "Backup"
-$MsiPath            = Join-Path $DownloadDir "velociraptor-v0.76.2-windows-amd64.msi"
-$LogPath            = Join-Path $LogDir "velociraptor-upgrade.log"
-$MsiLogPath         = Join-Path $LogDir "velociraptor-msi-install.log"
-$ConfigBackupPath   = Join-Path $BackupDir "client.config.yaml.backup"
+$DownloadDir             = Join-Path $WorkingDirectory "Downloads"
+$LogDir                  = Join-Path $WorkingDirectory "Logs"
+$BackupDir               = Join-Path $WorkingDirectory "Backup"
+$MsiPath                 = Join-Path $DownloadDir "velociraptor-v0.76.2-windows-amd64.msi"
+$LogPath                 = Join-Path $LogDir "velociraptor-upgrade.log"
+$MsiLogPath              = Join-Path $LogDir "velociraptor-msi-install.log"
+$ConfigBackupPath        = Join-Path $BackupDir "client.config.yaml.backup"
 
 function Write-Log {
     param(
@@ -64,7 +61,10 @@ function Write-Log {
     $timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "[$timestamp] [$Level] $Message"
     Write-Host $line
-    Add-Content -Path $LogPath -Value $line
+
+    if ($script:LogPathInitialized) {
+        Add-Content -Path $LogPath -Value $line
+    }
 }
 
 function Ensure-Directory {
@@ -79,6 +79,28 @@ function Test-IsAdministrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
     $principal = New-Object Security.Principal.WindowsPrincipal($identity)
     return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+function Get-VelociraptorService {
+    $services = Get-CimInstance Win32_Service -ErrorAction SilentlyContinue | Where-Object {
+        $_.Name -match 'Velociraptor' -or
+        $_.DisplayName -match 'Velociraptor' -or
+        $_.PathName -match 'Velociraptor'
+    }
+
+    if (-not $services) {
+        return $null
+    }
+
+    $preferred = $services | Where-Object {
+        $_.PathName -match [regex]::Escape($ExePath)
+    } | Select-Object -First 1
+
+    if ($preferred) {
+        return $preferred
+    }
+
+    return $services | Select-Object -First 1
 }
 
 function Get-InstalledVelociraptorVersion {
@@ -139,7 +161,7 @@ function Download-File {
     Write-Log "Downloading MSI from '$Url'."
 
     try {
-        Invoke-WebRequest -Uri $Url -OutFile $Destination -UseBasicParsing -MaximumRedirection 5
+        Invoke-WebRequest -Uri $Url -OutFile $Destination -MaximumRedirection 5
     }
     catch {
         throw "Failed to download MSI from '$Url'. $($_.Exception.Message)"
@@ -188,7 +210,7 @@ function Install-Msi {
 
 function Backup-ExistingConfig {
     if (-not (Test-Path -LiteralPath $InstalledConfig)) {
-        throw "Existing client config not found at '$InstalledConfig'. This script expects the endpoint to already have a valid client.config.yaml."
+        throw "Existing client config not found at '$InstalledConfig'."
     }
 
     Copy-Item -LiteralPath $InstalledConfig -Destination $ConfigBackupPath -Force
@@ -205,9 +227,11 @@ function Restore-ExistingConfig {
 }
 
 function Test-ServiceBinaryPath {
-    $svc = Get-CimInstance -ClassName Win32_Service -Filter "Name='Velociraptor Service'" -ErrorAction SilentlyContinue
+    param([Parameter(Mandatory = $true)][string]$Name)
+
+    $svc = Get-CimInstance Win32_Service -Filter "Name='$Name'" -ErrorAction SilentlyContinue
     if ($null -eq $svc) {
-        throw "Service '$ServiceName' not found after installation."
+        throw "Service '$Name' not found after installation."
     }
 
     if ($svc.PathName -match [regex]::Escape($ExePath)) {
@@ -224,6 +248,8 @@ try {
     Ensure-Directory -Path $LogDir
     Ensure-Directory -Path $BackupDir
     Ensure-Directory -Path $InstallDir
+
+    $script:LogPathInitialized = $true
 
     if (-not (Test-IsAdministrator)) {
         throw "This script must be run as Administrator."
@@ -247,22 +273,44 @@ try {
         Write-Log "No writeback file found at '$WritebackPath'. Continuing." "WARN"
     }
 
-    Stop-ServiceSafe -Name $ServiceName
+    $existingService = Get-VelociraptorService
+    if ($existingService) {
+        $serviceName = $existingService.Name
+        Write-Log "Detected Velociraptor service name: '$serviceName' (DisplayName: '$($existingService.DisplayName)')."
+    }
+    else {
+        $serviceName = $null
+        Write-Log "No existing Velociraptor service detected before upgrade. Continuing." "WARN"
+    }
+
+    if ($serviceName) {
+        Stop-ServiceSafe -Name $serviceName
+    }
+
     Backup-ExistingConfig
     Download-File -Url $DownloadUrl -Destination $MsiPath
     Install-Msi -Path $MsiPath
     Restore-ExistingConfig
-    Test-ServiceBinaryPath
-    Start-ServiceSafe -Name $ServiceName
+
+    $postInstallService = Get-VelociraptorService
+    if (-not $postInstallService) {
+        throw "Could not find the Velociraptor service after installation."
+    }
+
+    $serviceName = $postInstallService.Name
+    Write-Log "Using detected post-install service name: '$serviceName' (DisplayName: '$($postInstallService.DisplayName)')."
+
+    Test-ServiceBinaryPath -Name $serviceName
+    Start-ServiceSafe -Name $serviceName
 
     Start-Sleep -Seconds 5
 
-    $service = Get-Service -Name $ServiceName -ErrorAction Stop
+    $service = Get-Service -Name $serviceName -ErrorAction Stop
     if ($service.Status -ne "Running") {
-        throw "Service '$ServiceName' is not running after upgrade."
+        throw "Service '$serviceName' is not running after upgrade."
     }
 
-    Write-Log "Verified service '$ServiceName' is running."
+    Write-Log "Verified service '$serviceName' is running."
 
     if (-not $SkipVersionCheck) {
         $afterVersion = Get-InstalledVelociraptorVersion
